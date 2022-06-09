@@ -1,0 +1,3 @@
+[submodule "deps/relase/reshade"]
+	path = deps/release/reshade
+	url = https://github.com/advancedfx/reshade.git

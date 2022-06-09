@@ -1,0 +1,6 @@
+/build
+/ipch
+/.vs
+/*.VC.*
+/packages
+/out
