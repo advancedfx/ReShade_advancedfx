@@ -75,7 +75,7 @@ bool supply_depth(void* pDepthTextureResource) {
 	const resource_desc rs_depth_desc(device->get_resource_desc(rs_depth));
 	const resource_desc rs_depth_target_desc(dev_data.depth_texture != 0 ? device->get_resource_desc(dev_data.depth_texture) : resource_desc());
 
-	if (dev_data.depth_texture != 0 && (rs_depth_desc.texture.width != rs_depth_target_desc.texture.width || rs_depth_desc.texture.height != rs_depth_desc.texture.height)) {
+	if (dev_data.depth_texture != 0 && (rs_depth_desc.texture.width != rs_depth_target_desc.texture.width || rs_depth_desc.texture.height != rs_depth_desc.texture.height) || true) {
 		dev_data.free_resources();
 	}
 
@@ -83,7 +83,7 @@ bool supply_depth(void* pDepthTextureResource) {
 		resource_desc desc(rs_depth_desc);
 		desc.type = resource_type::texture_2d;
 		desc.heap = memory_heap::gpu_only;
-		desc.usage = resource_usage::shader_resource | resource_usage::render_target;
+		desc.usage = resource_usage::shader_resource | resource_usage::copy_dest;
 		desc.texture.format = format::r32_float;
 
 		if (device->create_resource(desc, nullptr, resource_usage::copy_dest, &dev_data.depth_texture))
@@ -92,7 +92,7 @@ bool supply_depth(void* pDepthTextureResource) {
 			return false;
 
 		resource_view_desc view_desc(format_to_default_typed(desc.texture.format));
-		if (!device->create_resource_view(dev_data.depth_texture, resource_usage::shader_resource | resource_usage::render_target, view_desc, &dev_data.depth_texture_view))
+		if (!device->create_resource_view(dev_data.depth_texture, resource_usage::shader_resource, view_desc, &dev_data.depth_texture_view))
 			return false;
 
 		float vertex_data[4][3] = {
@@ -123,12 +123,13 @@ bool supply_depth(void* pDepthTextureResource) {
 	rts.store_op = render_pass_store_op::store;
 	rts.view = dev_data.depth_texture_view;
 
-	// Ensure barriers are not created with 'D3D12_RESOURCE_STATE_[...]_SHADER_RESOURCE' when resource has 'D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE' flag set
-	const resource_usage old_state = rs_depth_desc.usage & (resource_usage::depth_stencil | resource_usage::shader_resource);
+	g_MainCommandList->barrier(dev_data.depth_texture, resource_usage::shader_resource, resource_usage::copy_dest);
+	g_MainCommandList->barrier(rs_depth, resource_usage::render_target, resource_usage::copy_source);
 
-	g_MainCommandList->barrier(rs_depth, old_state, resource_usage::copy_source);
 	g_MainCommandList->copy_resource(rs_depth, dev_data.depth_texture);
-	g_MainCommandList->barrier(rs_depth, resource_usage::copy_source, old_state);
+
+	g_MainCommandList->barrier(rs_depth, resource_usage::copy_source, resource_usage::render_target);
+	g_MainCommandList->barrier(dev_data.depth_texture, resource_usage::copy_dest, resource_usage::shader_resource);
 
 	return true;
 }
