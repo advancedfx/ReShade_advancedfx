@@ -3,12 +3,15 @@
 #include <imgui.h>
 #include <reshade.hpp>
 #include <vector>
+#include <queue>
 
 using namespace reshade::api;
 
 struct __declspec(uuid("745350f4-bd58-479b-8ad0-81e872a9952b")) device_data
 {
 	effect_runtime *main_runtime = nullptr;
+
+	bool block_effects = true;
 
 	bool _hasBackBuffer = false;
 	resource_desc _back_buffer_desc;
@@ -19,6 +22,7 @@ struct __declspec(uuid("745350f4-bd58-479b-8ad0-81e872a9952b")) device_data
 	resource _back_buffer_resolved = { 0 };
 	resource_view _back_buffer_resolved_srv = { 0 };
 	std::vector<resource_view> _back_buffer_targets;
+	std::queue<effect_technique> _disabled_techniques;
 
 	resource depth_texture = { 0 };
 	resource_view depth_texture_view = { 0 };
@@ -51,6 +55,22 @@ struct __declspec(uuid("745350f4-bd58-479b-8ad0-81e872a9952b")) device_data
 			if (runtime->get_annotation_string_from_uniform_variable(variable, "source", source) && std::strcmp(source, "bufready_depth") == 0)
 				runtime->set_uniform_value_bool(variable, depth_texture_view != 0);
 			});
+	}
+
+	void disable_techniques() {
+		main_runtime->enumerate_techniques(nullptr, [this](effect_runtime* runtime, auto technique) {
+			if (runtime->get_technique_state(technique)) {
+				_disabled_techniques.push(technique);
+				runtime->set_technique_state(technique, false);
+			}
+			});
+	}
+
+	void reenable_techniques() {
+		while (!_disabled_techniques.empty()) {
+			main_runtime->set_technique_state(_disabled_techniques.front(), true);
+			_disabled_techniques.pop();
+		}
 	}
 
 	void free_buffer_resources() {
@@ -233,6 +253,11 @@ bool supply_depth(void* pDepthTextureResource) {
 
 extern "C" bool __declspec(dllexport) AdvancedfxRenderEffects(void* pRenderTargetView, void * pDepthTextureResource) {
 
+	if (pRenderTargetView == 0) {
+		// HLAE wants us to render no effects.
+		return true;
+	}
+
 	if (g_MainCommandList == 0)
 		return false;
 
@@ -241,12 +266,6 @@ extern "C" bool __declspec(dllexport) AdvancedfxRenderEffects(void* pRenderTarge
 
 	if (dev_data.main_runtime == 0)
 		return false;
-
-	if (pRenderTargetView == 0) {
-		// HLAE wants us to render no effects.
-		dev_data.main_runtime->render_effects(g_MainCommandList, resource_view{ 0 });
-		return true;
-	}
 
 	resource back_buffer_resource{ (uint64_t)pRenderTargetView };
 
@@ -274,12 +293,16 @@ extern "C" bool __declspec(dllexport) AdvancedfxRenderEffects(void* pRenderTarge
 
 	if (dev_data._back_buffer_resolved != 0)
 	{
+		dev_data.block_effects = false;
 		dev_data.main_runtime->render_effects(g_MainCommandList, dev_data._back_buffer_targets[0], dev_data._back_buffer_targets[1]);
+		dev_data.block_effects = true;
 	}
 	else
 	{
 		g_MainCommandList->barrier(back_buffer_resource, resource_usage::present, resource_usage::render_target);
+		dev_data.block_effects = false;
 		dev_data.main_runtime->render_effects(g_MainCommandList, dev_data._back_buffer_targets[0], dev_data._back_buffer_targets[1]);
+		dev_data.block_effects = true;
 		g_MainCommandList->barrier(back_buffer_resource, resource_usage::render_target, resource_usage::present);
 	}
 
@@ -336,19 +359,26 @@ static void on_destroy_effect_runtime(effect_runtime *runtime)
 	}
 }
 
-static void on_draw_settings(effect_runtime *runtime)
+static void on_begin_render_effects(effect_runtime* runtime, command_list* cmd_list, resource_view, resource_view)
 {
-	device *const device = runtime->get_device();
-	auto &dev_data = device->get_private_data<device_data>();
-
-	if (runtime != dev_data.main_runtime)
-	{
-		ImGui::TextUnformatted("This is not the main effect runtime.");
+	if (g_MainCommandList == 0)
 		return;
-	}
 
-	ImGui::TextUnformatted("v1.1.0");
-	ImGui::TextUnformatted("There are no settings currently.");
+	device* const device = g_MainCommandList->get_device();
+	auto& dev_data = device->get_private_data<device_data>();
+
+	if (dev_data.block_effects) dev_data.disable_techniques();
+}
+
+static void on_finish_render_effects(effect_runtime* runtime, command_list* cmd_list, resource_view, resource_view)
+{
+	if (g_MainCommandList == 0)
+		return;
+
+	device* const device = g_MainCommandList->get_device();
+	auto& dev_data = device->get_private_data<device_data>();
+
+	if (dev_data.block_effects) dev_data.reenable_techniques();
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
@@ -364,7 +394,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 		reshade::register_event<reshade::addon_event::destroy_command_list>(on_destroy_command_list);
 		reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
 		reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
-		reshade::register_overlay(nullptr, on_draw_settings);
+		reshade::register_event<reshade::addon_event::reshade_begin_effects>(on_begin_render_effects);
+		reshade::register_event<reshade::addon_event::reshade_finish_effects>(on_finish_render_effects);
 
 		// Need to set texture binding again after reloading
 		reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(update_effect_runtime);
