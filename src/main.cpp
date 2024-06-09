@@ -48,7 +48,7 @@ struct __declspec(uuid("745350f4-bd58-479b-8ad0-81e872a9952b")) device_data
 		if (main_runtime == 0)
 			return;
 
-		main_runtime->update_texture_bindings("DEPTH", depth_texture_view);
+		main_runtime->update_texture_bindings("DEPTH", depth_texture_view, depth_texture_view);
 
 		main_runtime->enumerate_uniform_variables(nullptr, [this](effect_runtime* runtime, auto variable) {
 			char source[32] = "";
@@ -223,7 +223,7 @@ bool supply_depth(void* pDepthTextureResource) {
 		desc.type = resource_type::texture_2d;
 		desc.heap = memory_heap::gpu_only;
 		desc.usage = resource_usage::shader_resource | resource_usage::copy_dest;
-		desc.texture.format = format::r32_float;
+		//desc.texture.format = format::r32_float;
 
 		if (device->create_resource(desc, nullptr, resource_usage::copy_dest, &dev_data.depth_texture))
 			device->set_resource_name(dev_data.depth_texture, "ReShade advancedfx depth texture");
