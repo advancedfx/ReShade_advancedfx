@@ -8,6 +8,29 @@
 #include <map>
 #include <set>
 
+HMODULE g_hReShadeModule = nullptr;
+#define IDR_COPY_PS                     101
+#define IDR_FULLSCREEN_VS               102
+
+struct data_resource
+{
+	size_t data_size;
+	const void* data;
+};
+
+data_resource load_data_resource(HMODULE module_handke, unsigned short id)
+{
+	const HRSRC info = FindResource(module_handke, MAKEINTRESOURCE(id), RT_RCDATA);
+	assert(info != nullptr);
+	const HGLOBAL handle = LoadResource(module_handke, info);
+
+	data_resource result;
+	result.data = LockResource(handle);
+	result.data_size = SizeofResource(module_handke, info);
+
+	return result;
+}
+
 using namespace reshade::api;
 
 void update_dependent_effect_runtime(effect_runtime* runtime, resource depth_buffer_resource, resource_view rsv);
@@ -53,12 +76,21 @@ struct __declspec(uuid("4F2FCBC8-D459-4325-A4D8-4EE63F5C4571")) device_data_s
 		format _back_buffer_format;
 		uint16_t _back_buffer_samples;
 		resource _back_buffer_resolved = { 0 };
+		resource_view _back_buffer_resolved_srv = {};
 		std::vector<resource_view> _back_buffer_targets;
+		std::vector<resource_view> _back_buffer_revoled_targets;
 
 		void free_buffer_resources(device* device) {
 			if (_hasBackBuffer) {
+				for (const auto view : _back_buffer_revoled_targets)
+					device->destroy_resource_view(view);
+				_back_buffer_revoled_targets.clear();
+
+
 				device->destroy_resource(_back_buffer_resolved);
 				_back_buffer_resolved = {};
+				device->destroy_resource_view(_back_buffer_resolved_srv);
+				_back_buffer_resolved_srv = {};
 
 				for (const auto view : _back_buffer_targets)
 					device->destroy_resource_view(view);
@@ -113,41 +145,60 @@ struct __declspec(uuid("4F2FCBC8-D459-4325-A4D8-4EE63F5C4571")) device_data_s
 						break;
 					}
 
+					const bool need_copy_pipeline =
+						device->get_api() == device_api::d3d10 ||
+						device->get_api() == device_api::d3d11 ||
+						device->get_api() == device_api::d3d12;
+
+					resource_usage usage = resource_usage::render_target | resource_usage::copy_dest | resource_usage::resolve_dest;
+					if (need_copy_pipeline)
+						usage |= resource_usage::shader_resource;
+					else
+						usage |= resource_usage::copy_source;
+
 					if (!device->create_resource(
-						resource_desc(_width, _height, 1, 1, format_to_typeless(_back_buffer_format), 1, memory_heap::gpu_only, resource_usage::shader_resource | resource_usage::render_target),
-						nullptr, resource_usage::shader_resource | resource_usage::render_target, &_back_buffer_resolved) ||
+						resource_desc(_width, _height, 1, 1, format_to_typeless(_back_buffer_format), 1, memory_heap::gpu_only, usage),
+						nullptr, back_buffer_desc.texture.samples == 1 ? resource_usage::copy_dest : resource_usage::resolve_dest, &_back_buffer_resolved) ||
 						!device->create_resource_view(
 							_back_buffer_resolved,
 							resource_usage::render_target,
-							resource_view_desc(
-								resource_view_type::texture_2d,
-								format_to_default_typed(_back_buffer_format, 0), 0, 1, 0, 1),
-							&_back_buffer_targets.emplace_back()) ||
+							resource_view_desc(format_to_default_typed(_back_buffer_format, 0)),
+							&_back_buffer_revoled_targets.emplace_back()) ||
 						!device->create_resource_view(
 							_back_buffer_resolved,
 							resource_usage::render_target,
-							resource_view_desc(
-								resource_view_type::texture_2d,
-								format_to_default_typed(_back_buffer_format, 1), 0, 1, 0, 1),
-							&_back_buffer_targets.emplace_back()))
-					{
+							resource_view_desc(format_to_default_typed(_back_buffer_format, 1)),
+							&_back_buffer_revoled_targets.emplace_back())) {
 						free_buffer_resources(device);
 						return false;
 					}
+
+					if (need_copy_pipeline)
+					{
+						if (!device->create_resource_view(
+							_back_buffer_resolved,
+							resource_usage::shader_resource,
+							resource_view_desc(_back_buffer_format),
+							&_back_buffer_resolved_srv))
+						{
+							free_buffer_resources(device);
+							return false;
+						}
+					}
 				}
 				// Create render targets for the back buffer resources
-				else if (!device->create_resource_view(
+				if (!device->create_resource_view(
 					back_buffer_resource,
 					resource_usage::render_target,
 					resource_view_desc(
-						resource_view_type::texture_2d,
+						back_buffer_desc.texture.samples > 1 ? resource_view_type::texture_2d_multisample : resource_view_type::texture_2d,
 						format_to_default_typed(back_buffer_desc.texture.format, 0), 0, 1, 0, 1),
 					&_back_buffer_targets.emplace_back()) ||
 					!device->create_resource_view(
 						back_buffer_resource,
 						resource_usage::render_target,
 						resource_view_desc(
-							resource_view_type::texture_2d,
+							back_buffer_desc.texture.samples > 1 ? resource_view_type::texture_2d_multisample : resource_view_type::texture_2d,
 							format_to_default_typed(back_buffer_desc.texture.format, 1), 0, 1, 0, 1),
 						&_back_buffer_targets.emplace_back()))
 				{
@@ -221,7 +272,6 @@ struct __declspec(uuid("4F2FCBC8-D459-4325-A4D8-4EE63F5C4571")) device_data_s
 	std::map<resource, depth_texture_data_s, cmp_resource> _depth_buffers;
 	std::set<effect_runtime*> _effect_runtimes;
 
-
 	void free_depth_resources(device* device, resource depth_texture_resource) {
 		auto it = _depth_buffers.find(depth_texture_resource);
 		if (it != _depth_buffers.end()) {
@@ -247,6 +297,48 @@ struct __declspec(uuid("4F2FCBC8-D459-4325-A4D8-4EE63F5C4571")) device_data_s
 		}
 	}
 
+	pipeline _copy_pipeline = {};
+	pipeline_layout _copy_pipeline_layout = {};
+	sampler  _copy_sampler_state = {};
+
+	void on_init_device(device* device) {
+		sampler_desc sampler_desc = {};
+		sampler_desc.filter = filter_mode::min_mag_mip_point;
+		sampler_desc.address_u = texture_address_mode::clamp;
+		sampler_desc.address_v = texture_address_mode::clamp;
+		sampler_desc.address_w = texture_address_mode::clamp;
+
+		pipeline_layout_param layout_params[2];
+		layout_params[0] = descriptor_range{ 0, 0, 0, 1, shader_stage::all, 1, descriptor_type::sampler };
+		layout_params[1] = descriptor_range{ 0, 0, 0, 1, shader_stage::all, 1, descriptor_type::shader_resource_view };
+
+		const data_resource vs = load_data_resource(g_hReShadeModule,IDR_FULLSCREEN_VS);
+		const data_resource ps = load_data_resource(g_hReShadeModule,IDR_COPY_PS);
+
+		shader_desc vs_desc = { vs.data, vs.data_size };
+		shader_desc ps_desc = { ps.data, ps.data_size };
+
+		std::vector<pipeline_subobject> subobjects;
+		subobjects.push_back({ pipeline_subobject_type::vertex_shader, 1, &vs_desc });
+		subobjects.push_back({ pipeline_subobject_type::pixel_shader, 1, &ps_desc });
+
+		if (!device->create_pipeline_layout(2, layout_params, &_copy_pipeline_layout) ||
+			!device->create_pipeline(_copy_pipeline_layout, static_cast<uint32_t>(subobjects.size()), subobjects.data(), &_copy_pipeline) ||
+			!device->create_sampler(sampler_desc, &_copy_sampler_state))
+		{
+			
+		}
+	}
+
+	void on_destroy_device(device* device) {
+		device->destroy_pipeline(_copy_pipeline);
+		_copy_pipeline = {};
+		device->destroy_pipeline_layout(_copy_pipeline_layout);
+		_copy_pipeline_layout = {};
+		device->destroy_sampler(_copy_sampler_state);
+		_copy_sampler_state = {};
+	}
+
 	bool render_effects(device* device, effect_runtime* runtime, resource back_buffer_resource, resource depth_buffer_resource) {
 		auto& back_buffer_data = _back_buffers.emplace(std::piecewise_construct, std::forward_as_tuple(back_buffer_resource), std::forward_as_tuple()).first->second;
 		auto& depth_buffer_data = _depth_buffers.emplace(std::piecewise_construct, std::forward_as_tuple(depth_buffer_resource), std::forward_as_tuple()).first->second;
@@ -265,26 +357,15 @@ struct __declspec(uuid("4F2FCBC8-D459-4325-A4D8-4EE63F5C4571")) device_data_s
 				{
 					if (back_buffer_data._back_buffer_samples == 1)
 					{
-						const resource resources[2] = { back_buffer_resource, back_buffer_data._back_buffer_resolved };
-						const resource_usage state_old[2] = { old_back_buffer_resource_usage, resource_usage::shader_resource | resource_usage::render_target };
-						const resource_usage state_new[2] = { resource_usage::copy_source, resource_usage::copy_dest };
-						const resource_usage state_final[2] = { old_back_buffer_resource_usage, resource_usage::shader_resource | resource_usage::render_target };
-
-						command_list->barrier(2, resources, state_old, state_new);
+						command_list->barrier(back_buffer_resource, resource_usage::present, resource_usage::copy_source);
 						command_list->copy_texture_region(back_buffer_resource, 0, nullptr, back_buffer_data._back_buffer_resolved, 0, nullptr);
-						command_list->barrier(2, resources, state_new, state_final);
-
+						command_list->barrier(back_buffer_data._back_buffer_resolved, resource_usage::copy_dest, resource_usage::render_target);
 					}
 					else
 					{
-						const resource resources[2] = { back_buffer_resource, back_buffer_data._back_buffer_resolved };
-						const resource_usage state_old[2] = { old_back_buffer_resource_usage, resource_usage::shader_resource | resource_usage::render_target };
-						const resource_usage state_new[2] = { resource_usage::resolve_source, resource_usage::resolve_dest };
-						const resource_usage state_final[2] = { old_back_buffer_resource_usage, resource_usage::shader_resource | resource_usage::render_target };
-
-						command_list->barrier(2, resources, state_old, state_new);
+						command_list->barrier(back_buffer_resource, resource_usage::present, resource_usage::resolve_source);
 						command_list->resolve_texture_region(back_buffer_resource, 0, nullptr, back_buffer_data._back_buffer_resolved, 0, 0, 0, 0, back_buffer_data._back_buffer_format);
-						command_list->barrier(2, resources, state_new, state_final);
+						command_list->barrier(back_buffer_data._back_buffer_resolved, resource_usage::resolve_dest, resource_usage::render_target);
 					}
 				}
 
@@ -293,23 +374,14 @@ struct __declspec(uuid("4F2FCBC8-D459-4325-A4D8-4EE63F5C4571")) device_data_s
 						update_dependent_effect_runtime(runtime, depth_buffer_resource, depth_buffer_data._depth_texture_view);
 					}
 
-					auto old_depth_buffer_resource_usage = device->get_resource_desc(depth_buffer_resource).usage;
-
-					const resource resources[2] = { depth_buffer_resource, depth_buffer_data._depth_texture };
-					const resource_usage state_old[2] = { old_depth_buffer_resource_usage, resource_usage::shader_resource };
-					const resource_usage state_new[2] = { resource_usage::copy_source, resource_usage::copy_dest };
-					const resource_usage state_final[2] = { old_depth_buffer_resource_usage, resource_usage::shader_resource };
-
-					command_list->barrier(2, resources, state_old, state_new);
-
-					command_list->copy_resource(depth_buffer_resource, depth_buffer_data._depth_texture);
-
-					command_list->barrier(2, resources, state_new, state_final);
+					command_list->barrier(depth_buffer_resource, resource_usage::depth_stencil, resource_usage::copy_source);
+					command_list->copy_texture_region(depth_buffer_resource, 0, nullptr, depth_buffer_data._depth_texture, 0, nullptr);
+					command_list->barrier(depth_buffer_data._depth_texture, resource_usage::copy_dest, resource_usage::shader_resource);
 				}
 
 				if (back_buffer_data._back_buffer_resolved != 0)
 				{
-					runtime->render_effects(command_list, back_buffer_data._back_buffer_targets[0], back_buffer_data._back_buffer_targets[1]);
+					runtime->render_effects(command_list, back_buffer_data._back_buffer_revoled_targets[0], back_buffer_data._back_buffer_revoled_targets[1]);
 				}
 				else
 				{
@@ -321,29 +393,41 @@ struct __declspec(uuid("4F2FCBC8-D459-4325-A4D8-4EE63F5C4571")) device_data_s
 				// Stretch main render target back into MSAA back buffer if MSAA is active or copy when format conversion is required
 				if (back_buffer_data._back_buffer_resolved != 0)
 				{
-					if (back_buffer_data._back_buffer_samples == 1)
+					const resource resources[2] = { back_buffer_resource, back_buffer_data._back_buffer_resolved };
+					const resource_usage state_old[2] = { resource_usage::copy_source | resource_usage::resolve_source, resource_usage::render_target };
+					const resource_usage state_final[2] = { resource_usage::present, resource_usage::resolve_dest };
+
+					if (device->get_api() == device_api::d3d10 ||
+						device->get_api() == device_api::d3d11 ||
+						device->get_api() == device_api::d3d12)
 					{
-						const resource resources[2] = { back_buffer_resource, back_buffer_data._back_buffer_resolved };
-						const resource_usage state_old[2] = { old_back_buffer_resource_usage, resource_usage::shader_resource | resource_usage::render_target };
-						const resource_usage state_new[2] = { resource_usage::copy_dest, resource_usage::copy_source };
-						const resource_usage state_final[2] = { old_back_buffer_resource_usage, resource_usage::shader_resource | resource_usage::render_target };
+						const resource_usage state_new[2] = { resource_usage::render_target, resource_usage::shader_resource };
 
 						command_list->barrier(2, resources, state_old, state_new);
-						command_list->copy_texture_region(back_buffer_data._back_buffer_resolved, 0, nullptr, back_buffer_resource, 0, nullptr);
+
+						command_list->bind_pipeline(pipeline_stage::all_graphics, _copy_pipeline);
+
+						command_list->push_descriptors(shader_stage::pixel, _copy_pipeline_layout, 0, descriptor_table_update{ {}, 0, 0, 1, descriptor_type::sampler, &_copy_sampler_state });
+						command_list->push_descriptors(shader_stage::pixel, _copy_pipeline_layout, 1, descriptor_table_update{ {}, 0, 0, 1, descriptor_type::shader_resource_view, &back_buffer_data._back_buffer_resolved_srv });
+
+						const viewport viewport = { 0.0f, 0.0f, static_cast<float>(back_buffer_data._width), static_cast<float>(back_buffer_data._height), 0.0f, 1.0f };
+						command_list->bind_viewports(0, 1, &viewport);
+						const rect scissor_rect = { 0, 0, static_cast<int32_t>(back_buffer_data._width), static_cast<int32_t>(back_buffer_data._height) };
+						command_list->bind_scissor_rects(0, 1, &scissor_rect);
+
+						const bool srgb_write_enable = (back_buffer_data._back_buffer_format == format::r8g8b8a8_unorm_srgb || back_buffer_data._back_buffer_format == format::b8g8r8a8_unorm_srgb);
+						command_list->bind_render_targets_and_depth_stencil(1, &back_buffer_data._back_buffer_targets[srgb_write_enable?1:0]);
+
+						command_list->draw(3, 1, 0, 0);
+
 						command_list->barrier(2, resources, state_new, state_final);
 					}
 					else
 					{
-						const resource resources[2] = { back_buffer_resource, back_buffer_data._back_buffer_resolved };
-						const resource_usage state_old[2] = { old_back_buffer_resource_usage, resource_usage::shader_resource | resource_usage::render_target };
-						const resource_usage state_new[2] = { resource_usage::resolve_dest, resource_usage::resolve_dest };
-						const resource_usage state_final[2] = { old_back_buffer_resource_usage, resource_usage::shader_resource | resource_usage::render_target };
-
-						float color[4] = { 1.0f,1.0f,0.0f,1.0f };
-						command_list->clear_render_target_view(back_buffer_data._back_buffer_targets[0], color);
+						const resource_usage state_new[2] = { resource_usage::copy_dest, resource_usage::copy_source };
 
 						command_list->barrier(2, resources, state_old, state_new);
-						command_list->resolve_texture_region(back_buffer_data._back_buffer_resolved, 0, nullptr, back_buffer_resource, 0, 0, 0, 0, back_buffer_data._back_buffer_desc.texture.format);
+						command_list->copy_texture_region(back_buffer_data._back_buffer_resolved, 0, nullptr, back_buffer_resource, 0, nullptr);
 						command_list->barrier(2, resources, state_new, state_final);
 					}
 				}
@@ -398,9 +482,15 @@ extern "C" bool __declspec(dllexport) AdvancedfxRenderEffects(void* pRenderTarge
 
 static void on_init_device(device* device) {
 	device->create_private_data<device_data_s>();
+
+	auto device_data = device->get_private_data<device_data_s>();
+	device_data->on_init_device(device);
 }
 
 static void on_destroy_device(device* device) {
+	auto device_data = device->get_private_data<device_data_s>();
+	device_data->on_destroy_device(device);
+
 	device->destroy_private_data<device_data_s>();
 }
 
@@ -466,11 +556,39 @@ static void on_reshade_present(effect_runtime* runtime) {
 	if (nullptr == g_MainRuntime) g_MainRuntime = runtime;
 }
 
+
+HMODULE get_reshade_module_handle(HMODULE initial_handle = nullptr)
+{
+	static HMODULE handle = initial_handle;
+	if (handle == nullptr)
+	{
+		HMODULE modules[1024]; DWORD num = 0;
+		if (K32EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &num))
+		{
+			if (num > sizeof(modules))
+				num = sizeof(modules);
+
+			for (DWORD i = 0; i < num / sizeof(HMODULE); ++i)
+			{
+				if (GetProcAddress(modules[i], "ReShadeRegisterAddon") &&
+					GetProcAddress(modules[i], "ReShadeUnregisterAddon"))
+				{
+					handle = modules[i];
+					break;
+				}
+			}
+		}
+	}
+	return handle;
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 {
 	switch (fdwReason)
 	{
 	case DLL_PROCESS_ATTACH:
+		g_hReShadeModule = get_reshade_module_handle();
+
 		if (!reshade::register_addon(hModule))
 			return FALSE;
 
@@ -489,6 +607,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 		break;
 	case DLL_PROCESS_DETACH:
 		reshade::unregister_addon(hModule);
+		g_hReShadeModule = nullptr;
 		break;
 	}
 
