@@ -53,15 +53,12 @@ struct __declspec(uuid("4F2FCBC8-D459-4325-A4D8-4EE63F5C4571")) device_data_s
 		format _back_buffer_format;
 		uint16_t _back_buffer_samples;
 		resource _back_buffer_resolved = { 0 };
-		resource_view _back_buffer_resolved_srv = { 0 };
 		std::vector<resource_view> _back_buffer_targets;
 
 		void free_buffer_resources(device* device) {
 			if (_hasBackBuffer) {
 				device->destroy_resource(_back_buffer_resolved);
 				_back_buffer_resolved = {};
-				device->destroy_resource_view(_back_buffer_resolved_srv);
-				_back_buffer_resolved_srv = {};
 
 				for (const auto view : _back_buffer_targets)
 					device->destroy_resource_view(view);
@@ -117,22 +114,21 @@ struct __declspec(uuid("4F2FCBC8-D459-4325-A4D8-4EE63F5C4571")) device_data_s
 					}
 
 					if (!device->create_resource(
-						resource_desc(_width, _height, 1, 1, format_to_typeless(_back_buffer_format), 1, memory_heap::gpu_only, resource_usage::shader_resource | resource_usage::render_target | resource_usage::copy_dest | resource_usage::resolve_dest),
-						nullptr, back_buffer_desc.texture.samples == 1 ? resource_usage::copy_dest : resource_usage::resolve_dest, &_back_buffer_resolved) ||
-						!device->create_resource_view(
-							_back_buffer_resolved,
-							resource_usage::shader_resource,
-							resource_view_desc(_back_buffer_format),
-							&_back_buffer_resolved_srv) ||
+						resource_desc(_width, _height, 1, 1, format_to_typeless(_back_buffer_format), 1, memory_heap::gpu_only, resource_usage::shader_resource | resource_usage::render_target),
+						nullptr, resource_usage::shader_resource | resource_usage::render_target, &_back_buffer_resolved) ||
 						!device->create_resource_view(
 							_back_buffer_resolved,
 							resource_usage::render_target,
-							resource_view_desc(format_to_default_typed(_back_buffer_format, 0)),
+							resource_view_desc(
+								resource_view_type::texture_2d,
+								format_to_default_typed(_back_buffer_format, 0), 0, 1, 0, 1),
 							&_back_buffer_targets.emplace_back()) ||
 						!device->create_resource_view(
 							_back_buffer_resolved,
 							resource_usage::render_target,
-							resource_view_desc(format_to_default_typed(_back_buffer_format, 1)),
+							resource_view_desc(
+								resource_view_type::texture_2d,
+								format_to_default_typed(_back_buffer_format, 1), 0, 1, 0, 1),
 							&_back_buffer_targets.emplace_back()))
 					{
 						free_buffer_resources(device);
@@ -144,14 +140,14 @@ struct __declspec(uuid("4F2FCBC8-D459-4325-A4D8-4EE63F5C4571")) device_data_s
 					back_buffer_resource,
 					resource_usage::render_target,
 					resource_view_desc(
-						back_buffer_desc.texture.samples > 1 ? resource_view_type::texture_2d_multisample : resource_view_type::texture_2d,
+						resource_view_type::texture_2d,
 						format_to_default_typed(back_buffer_desc.texture.format, 0), 0, 1, 0, 1),
 					&_back_buffer_targets.emplace_back()) ||
 					!device->create_resource_view(
 						back_buffer_resource,
 						resource_usage::render_target,
 						resource_view_desc(
-							back_buffer_desc.texture.samples > 1 ? resource_view_type::texture_2d_multisample : resource_view_type::texture_2d,
+							resource_view_type::texture_2d,
 							format_to_default_typed(back_buffer_desc.texture.format, 1), 0, 1, 0, 1),
 						&_back_buffer_targets.emplace_back()))
 				{
@@ -269,15 +265,26 @@ struct __declspec(uuid("4F2FCBC8-D459-4325-A4D8-4EE63F5C4571")) device_data_s
 				{
 					if (back_buffer_data._back_buffer_samples == 1)
 					{
-						if(old_back_buffer_resource_usage != resource_usage::copy_source) command_list->barrier(back_buffer_resource, old_back_buffer_resource_usage, resource_usage::copy_source);
+						const resource resources[2] = { back_buffer_resource, back_buffer_data._back_buffer_resolved };
+						const resource_usage state_old[2] = { old_back_buffer_resource_usage, resource_usage::shader_resource | resource_usage::render_target };
+						const resource_usage state_new[2] = { resource_usage::copy_source, resource_usage::copy_dest };
+						const resource_usage state_final[2] = { old_back_buffer_resource_usage, resource_usage::shader_resource | resource_usage::render_target };
+
+						command_list->barrier(2, resources, state_old, state_new);
 						command_list->copy_texture_region(back_buffer_resource, 0, nullptr, back_buffer_data._back_buffer_resolved, 0, nullptr);
-						if (old_back_buffer_resource_usage != resource_usage::copy_source) command_list->barrier(back_buffer_data._back_buffer_resolved, resource_usage::copy_dest, old_back_buffer_resource_usage);
+						command_list->barrier(2, resources, state_new, state_final);
+
 					}
 					else
 					{
-						if (old_back_buffer_resource_usage != resource_usage::resolve_source) command_list->barrier(back_buffer_resource, old_back_buffer_resource_usage, resource_usage::resolve_source);
+						const resource resources[2] = { back_buffer_resource, back_buffer_data._back_buffer_resolved };
+						const resource_usage state_old[2] = { old_back_buffer_resource_usage, resource_usage::shader_resource | resource_usage::render_target };
+						const resource_usage state_new[2] = { resource_usage::resolve_source, resource_usage::resolve_dest };
+						const resource_usage state_final[2] = { old_back_buffer_resource_usage, resource_usage::shader_resource | resource_usage::render_target };
+
+						command_list->barrier(2, resources, state_old, state_new);
 						command_list->resolve_texture_region(back_buffer_resource, 0, nullptr, back_buffer_data._back_buffer_resolved, 0, 0, 0, 0, back_buffer_data._back_buffer_format);
-						if (old_back_buffer_resource_usage != resource_usage::resolve_source) command_list->barrier(back_buffer_data._back_buffer_resolved, resource_usage::resolve_dest, old_back_buffer_resource_usage);
+						command_list->barrier(2, resources, state_new, state_final);
 					}
 				}
 
@@ -288,13 +295,16 @@ struct __declspec(uuid("4F2FCBC8-D459-4325-A4D8-4EE63F5C4571")) device_data_s
 
 					auto old_depth_buffer_resource_usage = device->get_resource_desc(depth_buffer_resource).usage;
 
-					command_list->barrier(depth_buffer_data._depth_texture, resource_usage::shader_resource, resource_usage::copy_dest);
-					if(old_depth_buffer_resource_usage != resource_usage::copy_source) command_list->barrier(depth_buffer_resource, old_depth_buffer_resource_usage, resource_usage::copy_source);
+					const resource resources[2] = { depth_buffer_resource, depth_buffer_data._depth_texture };
+					const resource_usage state_old[2] = { old_depth_buffer_resource_usage, resource_usage::shader_resource };
+					const resource_usage state_new[2] = { resource_usage::copy_source, resource_usage::copy_dest };
+					const resource_usage state_final[2] = { old_depth_buffer_resource_usage, resource_usage::shader_resource };
+
+					command_list->barrier(2, resources, state_old, state_new);
 
 					command_list->copy_resource(depth_buffer_resource, depth_buffer_data._depth_texture);
 
-					if (old_depth_buffer_resource_usage != resource_usage::copy_source)command_list->barrier(depth_buffer_resource, resource_usage::copy_source, old_depth_buffer_resource_usage);
-					command_list->barrier(depth_buffer_data._depth_texture, resource_usage::copy_dest, resource_usage::shader_resource);
+					command_list->barrier(2, resources, state_new, state_final);
 				}
 
 				if (back_buffer_data._back_buffer_resolved != 0)
@@ -311,14 +321,31 @@ struct __declspec(uuid("4F2FCBC8-D459-4325-A4D8-4EE63F5C4571")) device_data_s
 				// Stretch main render target back into MSAA back buffer if MSAA is active or copy when format conversion is required
 				if (back_buffer_data._back_buffer_resolved != 0)
 				{
-					const resource resources[2] = { back_buffer_resource, back_buffer_data._back_buffer_resolved };
-					const resource_usage state_old[2] = { old_back_buffer_resource_usage, resource_usage::render_target };
-					const resource_usage state_new[2] = { resource_usage::copy_dest, resource_usage::copy_source };
-					const resource_usage state_final[2] = { old_back_buffer_resource_usage, resource_usage::resolve_dest };
+					if (back_buffer_data._back_buffer_samples == 1)
+					{
+						const resource resources[2] = { back_buffer_resource, back_buffer_data._back_buffer_resolved };
+						const resource_usage state_old[2] = { old_back_buffer_resource_usage, resource_usage::shader_resource | resource_usage::render_target };
+						const resource_usage state_new[2] = { resource_usage::copy_dest, resource_usage::copy_source };
+						const resource_usage state_final[2] = { old_back_buffer_resource_usage, resource_usage::shader_resource | resource_usage::render_target };
 
-					command_list->barrier(2, resources, state_old, state_new);
-					command_list->copy_texture_region(back_buffer_data._back_buffer_resolved, 0, nullptr, back_buffer_resource, 0, nullptr);
-					command_list->barrier(2, resources, state_new, state_final);
+						command_list->barrier(2, resources, state_old, state_new);
+						command_list->copy_texture_region(back_buffer_data._back_buffer_resolved, 0, nullptr, back_buffer_resource, 0, nullptr);
+						command_list->barrier(2, resources, state_new, state_final);
+					}
+					else
+					{
+						const resource resources[2] = { back_buffer_resource, back_buffer_data._back_buffer_resolved };
+						const resource_usage state_old[2] = { old_back_buffer_resource_usage, resource_usage::shader_resource | resource_usage::render_target };
+						const resource_usage state_new[2] = { resource_usage::resolve_dest, resource_usage::resolve_dest };
+						const resource_usage state_final[2] = { old_back_buffer_resource_usage, resource_usage::shader_resource | resource_usage::render_target };
+
+						float color[4] = { 1.0f,1.0f,0.0f,1.0f };
+						command_list->clear_render_target_view(back_buffer_data._back_buffer_targets[0], color);
+
+						command_list->barrier(2, resources, state_old, state_new);
+						command_list->resolve_texture_region(back_buffer_data._back_buffer_resolved, 0, nullptr, back_buffer_resource, 0, 0, 0, 0, back_buffer_data._back_buffer_desc.texture.format);
+						command_list->barrier(2, resources, state_new, state_final);
+					}
 				}
 
 				return true;
